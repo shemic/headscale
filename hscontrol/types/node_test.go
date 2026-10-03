@@ -18,6 +18,74 @@ import (
 	"tailscale.com/types/key"
 )
 
+func TestSubnetRoutesExactApproval(t *testing.T) {
+	approved4 := netip.MustParsePrefix("10.1.0.0/16")
+	approved6 := netip.MustParsePrefix("2001:db8:1::/48")
+	child := netip.MustParsePrefix("10.1.2.0/24")
+	unannounced := netip.MustParsePrefix("192.168.1.0/24")
+	exit4 := netip.MustParsePrefix("0.0.0.0/0")
+	exit6 := netip.MustParsePrefix("::/0")
+	node := Node{
+		ApprovedRoutes: []netip.Prefix{exit6, approved4, unannounced, exit4, approved6},
+		Hostinfo: &tailcfg.Hostinfo{
+			RoutableIPs: []netip.Prefix{approved6, child, exit4, approved4, exit6, approved4},
+		},
+	}
+
+	// Approval is an exact prefix match, and announced order and duplicates survive.
+	require.Equal(t, []netip.Prefix{approved6, approved4, approved4}, node.SubnetRoutes())
+	require.Equal(t, []netip.Prefix{exit4, exit6}, node.ExitRoutes())
+
+	node.ApprovedRoutes = []netip.Prefix{approved6}
+	require.Equal(t, []netip.Prefix{approved6}, node.SubnetRoutes())
+	node.Hostinfo.RoutableIPs = []netip.Prefix{approved4}
+	require.Nil(t, node.SubnetRoutes())
+	node.Hostinfo = nil
+	require.Nil(t, node.SubnetRoutes())
+	node.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{approved6}}
+	node.ApprovedRoutes = nil
+	require.Nil(t, node.SubnetRoutes())
+}
+
+func TestCanAccessRouteFuncRuleIsolation(t *testing.T) {
+	subnet := netip.MustParsePrefix("10.1.0.0/16")
+	node := Node{
+		IPv4:           new(netip.MustParseAddr("100.64.0.1")),
+		ApprovedRoutes: []netip.Prefix{subnet},
+		Hostinfo: &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{
+			subnet, netip.MustParsePrefix("10.2.0.0/16"),
+		}},
+	}
+	matchers := []matcher.Match{
+		matcher.MatchFromStrings([]string{"100.64.0.1"}, []string{"192.0.2.0/24"}),
+		matcher.MatchFromStrings([]string{"100.64.0.2"}, []string{"203.0.113.0/24"}),
+		matcher.MatchFromStrings([]string{"10.1.0.0/16"}, []string{"2001:db8:1::/48"}),
+		matcher.MatchFromStrings([]string{"2001:db8:2::/48"}, []string{"10.1.0.0/16"}),
+		matcher.MatchFromStrings([]string{"10.2.0.0/16"}, []string{"198.51.100.0/24"}),
+	}
+	canAccess := node.View().CanAccessRouteFunc(matchers)
+	for _, tc := range []struct {
+		route string
+		want  bool
+	}{
+		{route: "192.0.2.0/24", want: true},
+		{route: "203.0.113.0/24"},
+		{route: "2001:db8:1::/48", want: true},
+		{route: "2001:db8:2::/48", want: true},
+		{route: "198.51.100.0/24"},
+	} {
+		require.Equal(t, tc.want, canAccess(netip.MustParsePrefix(tc.route)), tc.route)
+	}
+
+	// Exit routes must not grant a router a source identity for every subnet.
+	node.ApprovedRoutes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
+	node.Hostinfo.RoutableIPs = node.ApprovedRoutes
+	canAccess = node.View().CanAccessRouteFunc([]matcher.Match{
+		matcher.MatchFromStrings([]string{"203.0.113.0/24"}, []string{"198.51.100.0/24"}),
+	})
+	require.False(t, canAccess(netip.MustParsePrefix("198.51.100.0/24")))
+}
+
 func Test_NodeCanAccess(t *testing.T) {
 	iap := func(ipStr string) *netip.Addr {
 		ip := netip.MustParseAddr(ipStr)

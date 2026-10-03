@@ -17,10 +17,15 @@ func ReduceRoutes(
 	routes []netip.Prefix,
 	matchers []matcher.Match,
 ) []netip.Prefix {
+	if len(routes) == 0 || len(matchers) == 0 {
+		return nil
+	}
+
 	var result []netip.Prefix
+	canAccessRoute := node.CanAccessRouteFunc(matchers)
 
 	for _, route := range routes {
-		if node.CanAccessRoute(matchers, route) {
+		if canAccessRoute(route) {
 			result = append(result, route)
 		}
 	}

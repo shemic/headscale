@@ -25,6 +25,94 @@ var p = func(prefStr string) netip.Prefix {
 	return ip
 }
 
+func TestReduceRoutesApprovalChanges(t *testing.T) {
+	subnet := p("10.1.0.0/16")
+	target := p("2001:db8:2::/48")
+	node := &types.Node{
+		IPv4:     ap("100.64.0.1"),
+		Hostinfo: &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{subnet}},
+	}
+	matchers := matcher.MatchesFromFilterRules([]tailcfg.FilterRule{{
+		SrcIPs:   []string{subnet.String()},
+		DstPorts: []tailcfg.NetPortRange{{IP: target.String(), Ports: tailcfg.PortRangeAny}},
+	}})
+	routes := []netip.Prefix{target}
+
+	require.Nil(t, ReduceRoutes(node.View(), routes, matchers))
+	node.ApprovedRoutes = []netip.Prefix{subnet}
+	require.Equal(t, routes, ReduceRoutes(node.View(), routes, matchers))
+	node.ApprovedRoutes = nil
+	require.Nil(t, ReduceRoutes(node.View(), routes, matchers))
+	node.ApprovedRoutes = []netip.Prefix{subnet}
+	node.Hostinfo.RoutableIPs = nil
+	require.Nil(t, ReduceRoutes(node.View(), routes, matchers))
+	node.Hostinfo.RoutableIPs = []netip.Prefix{subnet}
+	require.Equal(t, routes, ReduceRoutes(node.View(), routes, matchers))
+	require.Nil(t, ReduceRoutes(node.View(), routes, nil))
+	require.Nil(t, ReduceRoutes(types.NodeView{}, routes, matchers))
+}
+
+func TestReduceRoutesManyRoutes(t *testing.T) {
+	const count = 7260
+	routes := make([]netip.Prefix, count)
+	for i := range routes {
+		routes[i] = netip.PrefixFrom(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}), 32)
+	}
+	node := &types.Node{
+		IPv4:           ap("100.64.0.1"),
+		ApprovedRoutes: routes,
+		Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: routes},
+	}
+	matchers := matcher.MatchesFromFilterRules([]tailcfg.FilterRule{{
+		SrcIPs:   []string{"100.64.0.1"},
+		DstPorts: []tailcfg.NetPortRange{{IP: "10.0.0.0/24", Ports: tailcfg.PortRangeAny}},
+	}})
+	require.Equal(t, routes[:256], ReduceRoutes(node.View(), routes, matchers))
+}
+
+func BenchmarkReduceRoutesManyRoutes(b *testing.B) {
+	for _, count := range []int{100, 1000, 7260, 20000} {
+		routes := make([]netip.Prefix, count)
+		for i := range routes {
+			routes[i] = netip.PrefixFrom(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}), 32)
+		}
+		node := &types.Node{
+			IPv4:           ap("100.64.0.1"),
+			ApprovedRoutes: routes,
+			Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: routes},
+		}
+		for _, tc := range []struct {
+			name   string
+			source string
+			want   int
+		}{
+			{name: "allow-all", source: "*", want: count},
+			{name: "subnet-source", source: "10.0.0.0/8", want: count},
+			{name: "denied", source: "192.0.2.0/24"},
+		} {
+			b.Run(fmt.Sprintf("%s/%d", tc.name, count), func(b *testing.B) {
+				matchers := matcher.MatchesFromFilterRules([]tailcfg.FilterRule{{
+					SrcIPs:   []string{tc.source},
+					DstPorts: []tailcfg.NetPortRange{{IP: "203.0.113.0/24", Ports: tailcfg.PortRangeAny}},
+				}})
+				if tc.want > 0 {
+					matchers = matcher.MatchesFromFilterRules([]tailcfg.FilterRule{{
+						SrcIPs:   []string{tc.source},
+						DstPorts: []tailcfg.NetPortRange{{IP: "*", Ports: tailcfg.PortRangeAny}},
+					}})
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for b.Loop() {
+					if got := ReduceRoutes(node.View(), routes, matchers); len(got) != tc.want {
+						b.Fatalf("got %d routes, want %d", len(got), tc.want)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestBuildPeerMapFromPolicy(t *testing.T) {
 	n := func(id types.NodeID, ip, hostname, username string, routess ...string) *types.Node {
 		routes := make([]netip.Prefix, 0, len(routess))

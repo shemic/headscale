@@ -448,39 +448,43 @@ func (node *Node) canAccess(
 // matchers where [matcher.Match.DestsOverlapsPrefixes](0.0.0.0/0) already returns
 // true, so the check would be redundant for that case.
 func (node *Node) CanAccessRoute(matchers []matcher.Match, route netip.Prefix) bool {
+	return node.canAccessRouteFunc(matchers)(route)
+}
+
+// canAccessRouteFunc evaluates the node's source identities once for a batch of
+// routes. The returned predicate belongs to this node/policy snapshot only.
+func (node *Node) canAccessRouteFunc(matchers []matcher.Match) func(netip.Prefix) bool {
 	src := node.IPs()
 	subnetRoutes := node.SubnetRoutes()
+	var forward, reverse []matcher.Match
 
-	for _, matcher := range matchers {
-		if matcher.SrcsContainsIPs(src...) && matcher.DestsOverlapsPrefixes(route) {
-			return true
+	for _, m := range matchers {
+		// A subnet router can act as a source for its approved, announced subnets.
+		if m.SrcsContainsIPs(src...) || m.SrcsOverlapsPrefixes(subnetRoutes...) {
+			forward = append(forward, m)
 		}
 
-		if matcher.SrcsOverlapsPrefixes(route) && matcher.DestsContainsIP(src...) {
-			return true
-		}
-
-		// A subnet router acts on behalf of its advertised subnets.
-		// If the node's approved subnet routes overlap the source set
-		// and the route overlaps the destination set, the router needs
-		// this route to forward traffic from its local subnet.
-		if len(subnetRoutes) > 0 {
-			if matcher.SrcsOverlapsPrefixes(subnetRoutes...) &&
-				matcher.DestsOverlapsPrefixes(route) {
-				return true
-			}
-
-			// Reverse: traffic from the route's subnet is destined for
-			// this node's subnets; the router needs the route for return
-			// traffic.
-			if matcher.SrcsOverlapsPrefixes(route) &&
-				matcher.DestsOverlapsPrefixes(subnetRoutes...) {
-				return true
-			}
+		// The reverse direction supplies routes needed for return traffic.
+		if m.DestsContainsIP(src...) || m.DestsOverlapsPrefixes(subnetRoutes...) {
+			reverse = append(reverse, m)
 		}
 	}
 
-	return false
+	return func(route netip.Prefix) bool {
+		for _, m := range forward {
+			if m.DestsOverlapsPrefixes(route) {
+				return true
+			}
+		}
+
+		for _, m := range reverse {
+			if m.SrcsOverlapsPrefixes(route) {
+				return true
+			}
+		}
+
+		return false
+	}
 }
 
 func (nodes Nodes) FilterByIP(ip netip.Addr) Nodes {
@@ -629,14 +633,24 @@ func (node *Node) AnnouncedRoutes() []netip.Prefix {
 // by the node. See the comment in [Node.Proto] method and the implementation in
 // grpcv1.go/nodesToProto.
 func (node *Node) SubnetRoutes() []netip.Prefix {
+	announced := node.AnnouncedRoutes()
+	if len(announced) == 0 || len(node.ApprovedRoutes) == 0 {
+		return nil
+	}
+
+	approved := make(map[netip.Prefix]struct{}, len(node.ApprovedRoutes))
+	for _, route := range node.ApprovedRoutes {
+		approved[route] = struct{}{}
+	}
+
 	var routes []netip.Prefix
 
-	for _, route := range node.AnnouncedRoutes() {
+	for _, route := range announced {
 		if tsaddr.IsExitRoute(route) {
 			continue
 		}
 
-		if slices.Contains(node.ApprovedRoutes, route) {
+		if _, ok := approved[route]; ok {
 			routes = append(routes, route)
 		}
 	}
@@ -944,6 +958,16 @@ func (nv NodeView) CanAccessRoute(matchers []matcher.Match, route netip.Prefix) 
 	}
 
 	return nv.ж.CanAccessRoute(matchers, route)
+}
+
+// CanAccessRouteFunc returns a route predicate for this node and policy snapshot.
+// Reuse it within one route batch, and rebuild it when the node or policy changes.
+func (nv NodeView) CanAccessRouteFunc(matchers []matcher.Match) func(netip.Prefix) bool {
+	if !nv.Valid() {
+		return func(netip.Prefix) bool { return false }
+	}
+
+	return nv.ж.canAccessRouteFunc(matchers)
 }
 
 func (nv NodeView) AnnouncedRoutes() []netip.Prefix {
